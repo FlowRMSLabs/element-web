@@ -202,7 +202,10 @@ interface IState {
     hideToSRUsers: boolean;
     syncError: Error | null;
     serverConfig?: ValidatedServerConfig;
+
+    /** Has our MatrixClient started? */
     ready: boolean;
+
     threepidInvite?: IThreepidInvite;
     roomOobData?: object;
     pendingInitialSync?: boolean;
