@@ -8,7 +8,9 @@ SPDX-License-Identifier: AGPL-3.0-only OR GPL-3.0-only OR LicenseRef-Element-Com
 Please see LICENSE files in the repository root for full details.
 */
 
-import { type Action } from "./actions";
+import { logger } from "matrix-js-sdk/src/logger";
+
+import { Action } from "./actions";
 import { type ActionPayload, AsyncActionPayload } from "./payloads";
 
 type DispatchToken = string;
@@ -82,6 +84,11 @@ export class MatrixDispatcher {
      */
     // eslint-disable-next-line @typescript-eslint/naming-convention
     private _dispatch = (payload: ActionPayload): void => {
+        // Log all actions, except a few spammy ones
+        if (payload.action !== Action.UserActivity) {
+            logger.info(`Dispatch action ${payload.action}`, payload);
+        }
+
         invariant(!this.isDispatching(), "Dispatch.dispatch(...): Cannot dispatch in the middle of a dispatch.");
         this.startDispatching(payload);
         try {

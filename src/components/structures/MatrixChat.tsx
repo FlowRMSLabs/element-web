@@ -141,6 +141,7 @@ import Markdown from "../../Markdown";
 import { sanitizeHtmlParams } from "../../Linkify";
 import { isOnlyAdmin } from "../../utils/membership";
 import { ModuleApi } from "../../modules/Api.ts";
+import { logErrorAndShowErrorDialog } from "../../utils/ErrorUtils.tsx";
 
 // legacy export
 export { default as Views } from "../../Views";
@@ -411,61 +412,13 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
      *
      * {@link onWillStartClient} and {@link onClientStarted} will already have been called (but not necessarily
      * completed).
-     *
-     * This method either calls {@link onLiggedIn} directly, or switches to {@link Views.E2E_SETUP} or
-     * {@link Views.COMPLETE_SECURITY}, which will later call {@link onCompleteSecurityE2eSetupFinished}.
      */
     private async postLoginSetup(): Promise<void> {
-        const cli = MatrixClientPeg.safeGet();
-        const cryptoEnabled = Boolean(cli.getCrypto());
-        if (!cryptoEnabled) {
-            this.onLoggedIn();
-        }
-
-        const promisesList: Promise<any>[] = [this.firstSyncPromise.promise];
-        let crossSigningIsSetUp = false;
-        if (cryptoEnabled) {
-            // check if the user has previously published public cross-signing keys,
-            // as a proxy to figure out if it's worth prompting the user to verify
-            // from another device.
-            promisesList.push(
-                (async (): Promise<void> => {
-                    crossSigningIsSetUp = Boolean(await cli.getCrypto()?.userHasCrossSigningKeys());
-                })(),
-            );
-        }
-
+        // TODO: move to onUserCompletedLoginFlow?
         // Now update the state to say we're waiting for the first sync to complete rather
         // than for the login to finish.
         this.setState({ pendingInitialSync: true });
-
-        await Promise.all(promisesList);
-
-        if (!cryptoEnabled) {
-            this.setState({ pendingInitialSync: false });
-            return;
-        }
-
-        if (crossSigningIsSetUp) {
-            // if the user has previously set up cross-signing, verify this device so we can fetch the
-            // private keys.
-
-            const cryptoExtension = ModuleRunner.instance.extensions.cryptoSetup;
-            if (cryptoExtension.SHOW_ENCRYPTION_SETUP_UI == false) {
-                this.onLoggedIn();
-            } else {
-                this.setStateForNewView({ view: Views.COMPLETE_SECURITY });
-            }
-        } else if (!(await shouldSkipSetupEncryption(cli))) {
-            // if cross-signing is not yet set up, do so now if possible.
-            InitialCryptoSetupStore.sharedInstance().startInitialCryptoSetup(
-                cli,
-                this.onCompleteSecurityE2eSetupFinished,
-            );
-            this.setStateForNewView({ view: Views.E2E_SETUP });
-        } else {
-            this.onLoggedIn();
-        }
+        await this.firstSyncPromise.promise;
         this.setState({ pendingInitialSync: false });
     }
 
@@ -1385,10 +1338,10 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
     /**
      * Returns true if the user must go through the device verification process before they
      * can use the app.
-     * @returns true if the user must verify
+     *
+     * @returns true if the device is unverified, but crypto is enabled.
      */
-    private async shouldForceVerification(): Promise<boolean> {
-        if (!SdkConfig.get("force_verification")) return false;
+    private async deviceNeedsVerification(): Promise<boolean> {
         const mustVerifyFlag = localStorage.getItem("must_verify_device");
         if (!mustVerifyFlag) return false;
 
@@ -1416,8 +1369,6 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
         ThemeController.isLogin = false;
         this.themeWatcher?.recheck();
         StorageManager.tryPersistStorage();
-
-        await this.onShowPostLoginScreen();
     }
 
     /**
@@ -1429,15 +1380,55 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
      *  - by {@link onCompleteSecurityE2eSetupFinished}
      *
      * In other words, whenever we think we have completed the login and E2E setup tasks.
+     *
+     * TODO: fix docs
      */
-    private async onShowPostLoginScreen(): Promise<void> {
-        logger.debug("onShowPostLoginScreen: Transitioning to logged in view.");
+    private async showNextView(): Promise<void> {
+        const cli = MatrixClientPeg.safeGet();
+
+        const forceVerification = SdkConfig.get("force_verification");
+        logger.debug(`showNextView: current view=${this.state.view}; force_verification=${forceVerification}`);
+
+        // First of all, figure out if we need to do some cross-signing setup.
+        // Traditionally, we would only do that just after logging in, but with the advent of `force_verification`,
+        // we may need to do it on every restart.
+        if (
+            (this.state.view == Views.LOGIN || this.state.view == Views.REGISTER || forceVerification) &&
+            !(await shouldSkipSetupEncryption(cli))
+        ) {
+            const crypto = cli.getCrypto()!;
+
+            // Check if we need to create cross-signing keys for this user.
+            if (!(await crypto!.userHasCrossSigningKeys())) {
+                logger.debug("showNextView: user lacks cross-signing keys, starting setup");
+                InitialCryptoSetupStore.sharedInstance().startInitialCryptoSetup(
+                    cli,
+                    this.onCompleteSecurityE2eSetupFinished,
+                );
+                this.setStateForNewView({ view: Views.E2E_SETUP });
+                return;
+            }
+
+            // We have cross-signing keys, so see if we need to verify this device.
+            if (
+                ModuleRunner.instance.extensions.cryptoSetup.SHOW_ENCRYPTION_SETUP_UI &&
+                (await this.deviceNeedsVerification())
+            ) {
+                logger.debug("showNextView: user must verify device, starting verification");
+                this.setStateForNewView({ view: Views.COMPLETE_SECURITY });
+                return;
+            }
+        }
+
+        // We've done the E2E setup stuff, so we can transition to the regular application, with
+        // an appropriate screen.
+        logger.debug("showNextView: E2E setup done, transitioning to logged in view.");
 
         this.setStateForNewView({ view: Views.LOGGED_IN });
         // If a specific screen is set to be shown after login, show that above
         // all else, as it probably means the user clicked on something already.
         if (this.screenAfterLogin?.screen) {
-            logger.debug(`onShowPostLoginScreen: showing screen ${this.screenAfterLogin.screen}`);
+            logger.debug(`showNextView: showing screen ${this.screenAfterLogin.screen}`);
             this.showScreen(this.screenAfterLogin.screen, this.screenAfterLogin.params);
             this.screenAfterLogin = undefined;
         } else if (MatrixClientPeg.currentUserIsJustRegistered()) {
@@ -1446,7 +1437,7 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
             if (ThreepidInviteStore.instance.pickBestInvite()) {
                 // The user has a 3pid invite pending - show them that
                 const threepidInvite = ThreepidInviteStore.instance.pickBestInvite();
-                logger.debug(`onShowPostLoginScreen: showing room ${threepidInvite.roomId} after registration`);
+                logger.debug(`showNextView: showing room ${threepidInvite.roomId} after registration`);
 
                 // HACK: This is a pretty brutal way of threading the invite back through
                 // our systems, but it's the safest we have for now.
@@ -1455,11 +1446,11 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
             } else {
                 // The user has just logged in after registering,
                 // so show the homepage.
-                logger.debug("onShowPostLoginScreen: Showing home page after registration");
+                logger.debug("showNextView: Showing home page after registration");
                 dis.dispatch<ViewHomePagePayload>({ action: Action.ViewHomePage, justRegistered: true });
             }
         } else {
-            logger.debug("onShowPostLoginScreen: showScreenAfterLogin");
+            logger.debug("showNextView: showScreenAfterLogin");
             this.showScreenAfterLogin();
         }
 
@@ -1776,18 +1767,6 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
      */
     private async onClientStarted(): Promise<void> {
         const cli = MatrixClientPeg.safeGet();
-
-        const shouldForceVerification = await this.shouldForceVerification();
-        // XXX: Don't replace the screen if it's already one of these: postLoginSetup
-        // changes to these screens in certain circumstances so we shouldn't clobber it.
-        // We should probably have one place where we decide what the next screen is after
-        // login.
-        if (![Views.COMPLETE_SECURITY, Views.E2E_SETUP].includes(this.state.view)) {
-            if (shouldForceVerification) {
-                this.setStateForNewView({ view: Views.COMPLETE_SECURITY });
-            }
-        }
-
         const crypto = cli.getCrypto();
         if (crypto) {
             const blacklistEnabled = SettingsStore.getValueAt(SettingLevel.DEVICE, "blacklistUnverifiedDevices");
@@ -1803,6 +1782,8 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
         this.setState({
             ready: true,
         });
+
+        await this.showNextView();
     }
 
     public showScreen(screen: string, params?: { [key: string]: any }): void {
@@ -2110,18 +2091,9 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
     };
 
     /** Called when {@link Views.E2E_SETUP} or {@link Views.COMPLETE_SECURITY} have completed. */
-    private onCompleteSecurityE2eSetupFinished = async (): Promise<void> => {
-        const forceVerify = await this.shouldForceVerification();
-        if (forceVerify) {
-            const isVerified = await MatrixClientPeg.safeGet().getCrypto()?.isCrossSigningReady();
-            if (!isVerified) {
-                // We must verify but we haven't yet verified - don't continue logging in
-                return;
-            }
-        }
-
-        await this.onShowPostLoginScreen().catch((e) => {
-            logger.error("Exception showing post-login screen", e);
+    private onCompleteSecurityE2eSetupFinished = (): void => {
+        this.showNextView().catch((e) => {
+            logErrorAndShowErrorDialog("Exception showing post-login screen", e);
         });
     };
 
