@@ -472,6 +472,9 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
             | (Pick<IState, K> | IState | null),
         callback?: () => void,
     ): void {
+        if (state && "view" in state) {
+            logger.debug(`MatrixChat: Queuing change of view from ${Views[this.state.view]} to ${Views[state.view]}`);
+        }
         if (this.shouldTrackPageChange(this.state, { ...this.state, ...state })) {
             this.startPageChangeTimer();
         }
@@ -643,6 +646,7 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
     private onAction = (payload: ActionPayload): void => {
         // once the session lock has been stolen, don't try to do anything.
         if (this.state.view === Views.LOCK_STOLEN) {
+            logger.warn(`Ignoring action ${payload.action} as session lock has been stolen`);
             return;
         }
 
@@ -1424,10 +1428,13 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
      * In other words, whenever we think we have completed the login and E2E setup tasks.
      */
     private async onShowPostLoginScreen(): Promise<void> {
+        logger.debug("onShowPostLoginScreen: Transitioning to logged in view.");
+
         this.setStateForNewView({ view: Views.LOGGED_IN });
         // If a specific screen is set to be shown after login, show that above
         // all else, as it probably means the user clicked on something already.
         if (this.screenAfterLogin?.screen) {
+            logger.debug(`onShowPostLoginScreen: showing screen ${this.screenAfterLogin.screen}`);
             this.showScreen(this.screenAfterLogin.screen, this.screenAfterLogin.params);
             this.screenAfterLogin = undefined;
         } else if (MatrixClientPeg.currentUserIsJustRegistered()) {
@@ -1436,6 +1443,7 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
             if (ThreepidInviteStore.instance.pickBestInvite()) {
                 // The user has a 3pid invite pending - show them that
                 const threepidInvite = ThreepidInviteStore.instance.pickBestInvite();
+                logger.debug(`onShowPostLoginScreen: showing room ${threepidInvite.roomId} after registration`);
 
                 // HACK: This is a pretty brutal way of threading the invite back through
                 // our systems, but it's the safest we have for now.
@@ -1444,9 +1452,11 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
             } else {
                 // The user has just logged in after registering,
                 // so show the homepage.
+                logger.debug("onShowPostLoginScreen: Showing home page after registration");
                 dis.dispatch<ViewHomePagePayload>({ action: Action.ViewHomePage, justRegistered: true });
             }
         } else {
+            logger.debug("onShowPostLoginScreen: showScreenAfterLogin");
             this.showScreenAfterLogin();
         }
 
@@ -1510,15 +1520,19 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
         // If screenAfterLogin is set, use that, then null it so that a second login will
         // result in view_home_page, _user_settings or _room_directory
         if (this.screenAfterLogin && this.screenAfterLogin.screen) {
+            logger.debug(`showScreenAfterLogin: showing screen ${this.screenAfterLogin.screen}`);
             this.showScreen(this.screenAfterLogin.screen, this.screenAfterLogin.params);
             this.screenAfterLogin = undefined;
         } else if (localStorage && localStorage.getItem("mx_last_room_id")) {
             // Before defaulting to directory, show the last viewed room
+            logger.debug(`showScreenAfterLogin: showing last room`);
             this.viewLastRoom();
         } else {
             if (MatrixClientPeg.safeGet().isGuest()) {
+                logger.debug(`showScreenAfterLogin: showing guest welcome page`);
                 dis.dispatch({ action: "view_welcome_page" });
             } else {
+                logger.debug(`showScreenAfterLogin: showing home page`);
                 dis.dispatch({ action: Action.ViewHomePage });
             }
         }
@@ -1789,10 +1803,15 @@ export default class MatrixChat extends React.PureComponent<IProps, IState> {
     }
 
     public showScreen(screen: string, params?: { [key: string]: any }): void {
+        logger.debug(`showScreen ${screen}`);
+
         const cli = MatrixClientPeg.get();
         const isLoggedOutOrGuest = !cli || cli.isGuest();
         if (!isLoggedOutOrGuest && AUTH_SCREENS.includes(screen)) {
             // user is logged in and landing on an auth page which will uproot their session, redirect them home instead
+            logger.info(
+                `showScreen: suppressing change to AuthScreen ${screen} for logged-in user, and going to home screen instead`,
+            );
             dis.dispatch({ action: Action.ViewHomePage });
             return;
         }
